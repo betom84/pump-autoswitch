@@ -89,7 +89,7 @@ loop:
 
 func newPumpSwitcher(ctx context.Context, client MQTT.Client) chan<- StationState {
 	stationStates := make(map[string]bool)
-	states := make(chan StationState)
+	states := make(chan StationState, 10)
 
 	duration := 5 * time.Second
 	ticker := time.NewTicker(duration)
