@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
@@ -42,9 +43,10 @@ func main() {
 	opts := MQTT.NewClientOptions()
 	opts.AddBroker(*broker)
 	opts.SetClientID("pump-autoswitch")
-	opts.SetDefaultPublishHandler(func(client MQTT.Client, msg MQTT.Message) {
-		messages <- msg
-	})
+	opts.SetDefaultPublishHandler(func(client MQTT.Client, msg MQTT.Message) { messages <- msg })
+	opts.OnConnect = func(c MQTT.Client) { slog.Info("mqtt client connected") }
+	opts.OnConnectionLost = func(c MQTT.Client, err error) { slog.Error("mqtt connection lost", slog.Any("error", err)) }
+	opts.OnReconnecting = func(c MQTT.Client, co *MQTT.ClientOptions) { slog.Info("mqtt client reconnecting") }
 
 	client := MQTT.NewClient(opts)
 	if token := client.Connect(); token.Wait() && token.Error() != nil {
@@ -61,6 +63,7 @@ func main() {
 		"opensprinkler/station/5": byte(1),
 		"opensprinkler/station/6": byte(1),
 		"opensprinkler/station/7": byte(1),
+		"shellies/pump/relay/0":   byte(1), // for debugging purposes
 	}
 
 	if token := client.SubscribeMultiple(stations, nil); token.Wait() && token.Error() != nil {
@@ -71,15 +74,23 @@ loop:
 	for {
 		select {
 		case msg := <-messages:
-			slog.Debug(fmt.Sprintf("RECEIVED TOPIC: %s MESSAGE: %s", msg.Topic(), msg.Payload()))
+			slog.Debug("mqtt message incomming", slog.String("topic", msg.Topic()), slog.String("payload", string(msg.Payload())))
 
-			var payload struct {
-				State int `json:"state"`
-			}
+			if strings.HasPrefix(msg.Topic(), "opensprinkler/station") {
+				var payload struct {
+					State int `json:"state"`
+				}
 
-			if err := json.NewDecoder(bytes.NewReader(msg.Payload())).Decode(&payload); err == nil {
+				err := json.NewDecoder(bytes.NewReader(msg.Payload())).Decode(&payload)
+				if err != nil {
+					slog.Error("failed to parse message", slog.Any("error", err))
+					continue
+				}
+
 				switcher <- StationState{msg.Topic(), payload.State == 1}
 			}
+
+			msg.Ack()
 
 		case <-ctx.Done():
 			break loop
@@ -99,11 +110,12 @@ func newPumpSwitcher(ctx context.Context, client MQTT.Client) chan<- StationStat
 		for {
 			select {
 			case state := <-states:
+				slog.Debug("station state updated", slog.String("station", state.station), slog.Bool("state", state.state))
+
 				stationStates[state.station] = state.state
 				ticker.Reset(duration)
 
 				if !state.state {
-					slog.Debug("station disabled, reset timer", slog.String("station", state.station))
 					continue
 				}
 
@@ -121,17 +133,23 @@ func newPumpSwitcher(ctx context.Context, client MQTT.Client) chan<- StationStat
 				p = p || s
 			}
 
-			switchPump(client, p)
-
-			if p != isPumpActive {
-				message := "Pump turned off"
-				if p {
-					message = "Pump turned on"
-				}
-
-				notify(message)
-				isPumpActive = p
+			if p == isPumpActive {
+				continue
 			}
+
+			err := switchPump(client, p)
+			if err != nil {
+				notify("Failed to switch pump!")
+				continue
+			}
+
+			message := "Pump turned off"
+			if p {
+				message = "Pump turned on"
+			}
+
+			notify(message)
+			isPumpActive = p
 		}
 	}()
 
@@ -144,10 +162,11 @@ func switchPump(client MQTT.Client, active bool) error {
 		payload = "on"
 	}
 
-	slog.Debug(fmt.Sprintf("PUMP: %s", payload))
+	slog.Debug("switching pump", slog.String("payload", payload))
+
 	token := client.Publish("shellies/pump/relay/0/command", byte(1), false, payload)
 	if token.Wait() != true {
-		slog.Error(fmt.Sprintf("ERROR: %s", token.Error()))
+		slog.Error("failed to publish message", slog.Any("error", token.Error()))
 	}
 
 	return token.Error()
